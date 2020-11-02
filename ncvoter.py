@@ -10,6 +10,7 @@ import simple_cache
 
 '''
 source: https://www.ncsbe.gov/results-data/absentee-data
+https://dl.ncsbe.gov/?prefix=ENRS/2020_11_03/
 '''
 class db():
     def __init__(self, db_file='ncvoter.db'):
@@ -22,12 +23,13 @@ class db():
     def __del__(self):
         self.conn.close()
 
-    def import(self, year=2020):
-        sql='''
-        
-        '''
-
-    def reindex(self):
+    def reindex(self, year=None):
+        if year is None:
+            start = 2008
+            end = 2020
+        else:
+            start=year
+        end+=4
         for year in range(2008,2024,4):
             print(year)
             sql = f'CREATE INDEX "idx_{year}_ncid" ON "NC{year}" ( "ncid", "voter_reg_num", "ballot_rtn_status");'
@@ -97,7 +99,7 @@ class db():
 
         return result
 
-    def rejected_voters(self):
+    def rejected_voters_list(self):
         # find voter ids of all voters with more than one entry, ignoring those marked cancelled
         sql = '''SELECT ncid, voter_reg_num, COUNT(*) as count FROM (select * from NC2020 where ballot_rtn_status != "CANCELLED") GROUP BY ncid, voter_reg_num HAVING COUNT(*) > 1 order by count asc '''
         # SELECT ncid, voter_reg_num, COUNT(*) as count FROM NC2020 GROUP BY ncid, voter_reg_num HAVING COUNT(*) > 1 order by count asc
@@ -106,6 +108,115 @@ class db():
             # save to a JSON file, just 'cause
             json.dump(data, outfile, indent=4)
         return data
+
+    def rejected_voters_table(self):
+        self.create_rejected_voters_table()
+        cnt = 0
+        data = self.rejected_voters_list()
+        for row in tqdm(data):
+            cnt += 1
+            # if row['count'] <= 2 or row['count'] > 4:
+            #     continue
+            id = row['ncid']
+            cols = ["county_desc", "ballot_rtn_status", "ballot_rtn_dt", "site_name", "ballot_req_type"]
+            sql = f'''
+            select {', '.join(cols)} from NC2020 where ncid = "{id}" order by ballot_rtn_dt ASC, ballot_rtn_status DESC
+            '''
+            data = self.query(sql, cols)
+            linestr = f"{data[0]['county_desc']}"
+            accepted_ballot_rtn_dt, accepted_req_type, accepted_site_name, failed_ballot_rtn_dt, failed_ballot_rtn_status, failed_req_types, failed_site_names = self.process_line(
+                data)
+
+            dates = sorted([sub['ballot_rtn_dt'] for sub in data])
+            req_types = [sub['ballot_req_type'] for sub in data]
+            rtn_statuses = [sub['ballot_rtn_status'] for sub in data]
+            rtn_site_names = [sub['site_name'].replace("'", "''") for sub in data]
+
+            story = "unknown"
+            accepted = -1
+            if 'ACCEPTED' in rtn_statuses:
+                accepted = 1
+                if len(set(dates)) == 1:
+                    story = f'same day'
+                    continue
+                elif len(set(req_types)) == 1:
+                    story = f'cured via {req_types[0]}'
+                else:
+                    if len(set(failed_req_types)) > 1:
+                        story = f'{",".join(set(failed_req_types))} cured via {accepted_req_type}'
+                    else:
+                        story = f'{failed_req_types[0]} cured via {accepted_req_type}'
+            else:
+                accepted = 0
+                story = 'not accepted'
+            failed_cnt = len(set(failed_ballot_rtn_dt))
+            self.insert_into_rejected_voters_table(accepted, accepted_ballot_rtn_dt, accepted_req_type,
+                                                   accepted_site_name, data, failed_ballot_rtn_dt,
+                                                   failed_ballot_rtn_status, failed_req_types, failed_site_names, id)
+
+            if story == 'unknown':
+                pprint(data)
+                print(sql)
+                print(e)
+                raise
+
+    def create_rejected_voters_table(self):
+        sql = '''drop table if exists rejected_voters_2020;
+        CREATE TABLE rejected_voters_2020 (county, ncid, accepted, accepted_method, accepted_site_name, date_first_rejection, date_accepted, failed_attempts, failed_methods, failed_dates, failed_ballot_rtn_statuses, failed_site_names);
+        '''
+        self.conn.executescript(sql)
+        self.conn.commit()
+
+    def insert_into_rejected_voters_table(self, accepted, accepted_ballot_rtn_dt, accepted_req_type, accepted_site_name,
+                                          data, failed_ballot_rtn_dt, failed_ballot_rtn_status, failed_req_types,
+                                          failed_site_names, id):
+        sql = f'''INSERT OR REPLACE INTO rejected_voters_2020 (county, ncid, 
+                                                         accepted, accepted_method, accepted_site_name, date_first_rejection, date_accepted, 
+                                                         failed_attempts, failed_methods, failed_dates,
+                                                         failed_ballot_rtn_statuses, failed_site_names)
+                 VALUES ('{data[0]["county_desc"]}', '{id}', 
+                          {accepted}, '{accepted_req_type}' , '{accepted_site_name}', '{failed_ballot_rtn_dt[0]}', '{accepted_ballot_rtn_dt}',
+                          {len(failed_req_types)}, '{",".join(set(failed_req_types))}','{",".join(set(failed_ballot_rtn_dt))}',
+                         '{",".join(set(failed_ballot_rtn_status))}',
+                         '{",".join(set(failed_site_names))}'
+                        );
+                   '''
+        try:
+            count = self.cur.execute(sql)
+            self.conn.commit()
+        except Exception as e:
+            pprint(data)
+            print(sql)
+            print(e)
+            raise
+        return sql
+
+    def process_line(self, data):
+        accepted_req_type = None
+        accepted_ballot_rtn_dt = None
+        accepted_site_name = None
+        failed_req_types = []
+        failed_site_names = []
+        failed_ballot_rtn_dt = []
+        failed_ballot_rtn_status = []
+        for attempt in data:
+            if attempt['ballot_req_type'] == 'MAIL':
+                attempt['site_name'] = 'MAIL'
+            if attempt['ballot_rtn_status'] == 'ACCEPTED':
+                accepted_req_type = attempt['ballot_req_type']
+                accepted_site_name = attempt['site_name'].replace("'", "''")
+                accepted_ballot_rtn_dt = attempt['ballot_rtn_dt']
+            else:
+                failed_req_types.append(attempt['ballot_req_type'])
+                failed_site_names.append(attempt['site_name'].replace("'", "''"))
+                failed_ballot_rtn_dt.append(attempt['ballot_rtn_dt'])
+                failed_ballot_rtn_status.append(attempt['ballot_rtn_status'].replace("'", "''"))
+        if accepted_ballot_rtn_dt is not None and accepted_ballot_rtn_dt in failed_ballot_rtn_dt:
+            # strip date ballot was accepted from list of failed dates
+            while accepted_ballot_rtn_dt in failed_ballot_rtn_dt:
+                failed_ballot_rtn_dt.remove(accepted_ballot_rtn_dt)
+        return accepted_ballot_rtn_dt, accepted_req_type, accepted_site_name, failed_ballot_rtn_dt, failed_ballot_rtn_status, failed_req_types, failed_site_names
+
 
 class MyTestCase(unittest.TestCase):
     def test_columns(self):
@@ -122,106 +233,19 @@ class MyTestCase(unittest.TestCase):
             print(this-that)
             prev=year
 
+    def test_rejected_voters_list(self):
+        uut=db()
+        uut.rejected_voters_list()
 
-    def test_dupes(self):
-        self.rejected_voters()
+    def test_age_demo(self):
+        uut=db()
+        data = uut.query('select age,  count(distinct ncid) from NC2016 group by age', ['age', 'cnt'])
+        pprint (data)
 
+    def test_rejected_voters_table(self):
+        uut=db()
+        uut.rejected_voters_table()
 
-
-    def test_inv(self):
-        with open('dupes.json') as json_file:
-            data = json.load(json_file)
-        cnt =0
-        uut = db()
-        for row in tqdm(data):
-            cnt+=1
-            # if row['count'] <= 2 or row['count'] > 4:
-            #     continue
-            id = row['ncid']
-            cols = ["county_desc", "ballot_rtn_status", "ballot_rtn_dt", "site_name", "ballot_req_type"]
-            sql = f'''
-            select {', '.join(cols)} from NC2020 where ncid = "{id}" order by ballot_rtn_dt ASC, ballot_rtn_status DESC
-            '''
-            data = uut.query(sql, cols)
-            linestr = f"{data[0]['county_desc']}"
-            accepted_req_type = None
-            accepted_ballot_rtn_dt = None
-            accepted_site_name = None
-            failed_req_types = []
-            failed_site_names = []
-            failed_ballot_rtn_dt = []
-            failed_ballot_rtn_status = []
-            for attempt in data:
-                if attempt['ballot_req_type'] == 'MAIL':
-                    attempt['site_name'] = 'MAIL'
-                if attempt['ballot_rtn_status'] == 'ACCEPTED':
-                    accepted_req_type = attempt['ballot_req_type']
-                    accepted_site_name = attempt['site_name'].replace("'", "''")
-                    accepted_ballot_rtn_dt = attempt['ballot_rtn_dt']
-                else:
-                    failed_req_types.append( attempt['ballot_req_type'])
-                    failed_site_names.append( attempt['site_name'].replace("'", "''"))
-                    failed_ballot_rtn_dt.append(attempt['ballot_rtn_dt'])
-                    failed_ballot_rtn_status.append(attempt['ballot_rtn_status'].replace("'", "''"))
-            if accepted_ballot_rtn_dt is not None and accepted_ballot_rtn_dt in failed_ballot_rtn_dt:
-                # strip date ballot was accepted from list of failed dates
-                while accepted_ballot_rtn_dt in failed_ballot_rtn_dt:
-                    failed_ballot_rtn_dt.remove(accepted_ballot_rtn_dt)
-
-            dates = sorted([sub['ballot_rtn_dt'] for sub in data])
-            req_types = [sub['ballot_req_type'] for sub in data]
-            rtn_statuses = [sub['ballot_rtn_status'] for sub in data]
-            rtn_site_names = [sub['site_name'].replace("'", "''") for sub in data]
-
-            story = "unknown"
-            accepted=-1
-            if 'ACCEPTED' in rtn_statuses:
-                accepted=1
-                if len(set(dates)) == 1:
-                    story = f'same day'
-                    continue
-                elif len(set(req_types)) == 1:
-                    story=f'cured via {req_types[0]}'
-                else:
-                    if len(set(failed_req_types)) > 1:
-                        story=f'{",".join(set(failed_req_types))} cured via {accepted_req_type}'
-                    else:
-                        story=f'{failed_req_types[0]} cured via {accepted_req_type}'
-            else:
-                accepted=0
-                story ='not accepted'
-            failed_cnt=len(set(failed_ballot_rtn_dt))
-            sql=None
-            try:
-                sql = f'''INSERT OR REPLACE INTO multivotes2020 (county, ncid, 
-                                                                 accepted, accepted_method, accepted_site_name, date_first_rejection, date_accepted, 
-                                                                 failed_attempts, failed_methods, failed_dates,
-                                                                 failed_ballot_rtn_statuses,
-                                                                 failed_site_names)
-                     VALUES ('{data[0]["county_desc"]}', '{id}', 
-                              {accepted}, '{accepted_req_type}' , '{accepted_site_name}', '{failed_ballot_rtn_dt[0]}', '{accepted_ballot_rtn_dt}',
-                              {len(failed_req_types)}, '{",".join(set(failed_req_types))}','{",".join(set(failed_ballot_rtn_dt))}',
-                             '{",".join(set(failed_ballot_rtn_status))}',
-                             '{",".join(set(failed_site_names))}'
-                            );
-                   '''
-                count = uut.cur.execute(sql)
-                if cnt % 10 == 0:
-                    uut.conn.commit()
-            except Exception as e:
-                pprint(data)
-                print(sql)
-                print(e)
-
-                raise
-
-
-            # print(f"{cnt} {id} {story} failed {failed_cnt}")
-            if story == 'unknown':
-                pprint(data)
-                print(sql)
-                print(e)
-                raise
 
 
     def test_reindex(self):
@@ -239,21 +263,48 @@ class MyTestCase(unittest.TestCase):
                 accpted = None
             print(f"{year} {accpted}")
 
-    def test_multis(self):
-        uut = db()
-        sql = "SELECT count (distinct ncid) from NC2020 as cnt "
-        voters_unique = uut.query(sql, ['cnt'])[0]['cnt']
-        sql = "SELECT count (distinct ncid) from multivotes2020 as cnt "
-        multi_voters = uut.query(sql, ['cnt'])[0]['cnt']
-        sql = "SELECT count (distinct ncid) from multivotes2020 as cnt  where accepted = 1"
-        multi_voters_accepted = uut.query(sql, ['cnt'])[0]['cnt']
-        multi_voters_rejected = multi_voters- multi_voters_accepted
+    def test_story(self):
+        uut=db()
+        ###################
+        # outstanding votes
+        ###################
+        earlyintotal=4560358
 
-        print(f"corrected ballots:   {multi_voters_accepted:6,} of {voters_unique:6,} {round(((multi_voters_accepted/voters_unique)*100),2):.2f}%")
-        print(f"outstanding ballots: {multi_voters_rejected:6,} of {voters_unique:6,} {round(((multi_voters_rejected/voters_unique)*100),2):.2f}%")
+        # rejected
+        sql = '''select count(distinct ncid) as count from NC2020 where ballot_req_type like "%MAIL%" '''
+        # data = uut.query(sql, ['cnt'])
+        # mailintotal=data[0]['cnt']
+        mailintotal = 955809
+        print(f"mail-in voters: {mailintotal}")
 
-        # print(f"{voters_accepted} {rate_reject*100:.2f}%")
-        # print(f"{voters - voters_accepted} not yet accepted")
+        sql = '''select count(distinct(ncid)) from rejected_voters_2020'''
+        # data = uut.query(sql, ['cnt'])
+        # rejectedtotal=data[0]['cnt']
+        rejectedtotal=14893
+        print(f"rejected voters: {rejectedtotal}")
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where accepted_method = "None" '''
+        data = uut.query(sql, ['cnt'])
+        rejectednotfixed = data[0]['cnt']
+        print(f"rejected voters not fixed: {rejectednotfixed} {round(((rejectednotfixed/rejectedtotal)*100),2)}%")
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where accepted_method != "None" '''
+        data = uut.query(sql, ['cnt'])
+        rejectedfixed = data[0]['cnt']
+        print(f"rejected voters fixed: {rejectedfixed} {round(((rejectedfixed/rejectedtotal)*100),2)}%")
+
+        self.assertTrue(rejectednotfixed+rejectedfixed ==rejectedtotal )
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method = "MAIL" '''
+        data = uut.query(sql, ['cnt'])
+        mailfixedbymail = data[0]['cnt']
+        print(f"rejected voters fixed by mail: {mailfixedbymail} {round(((mailfixedbymail/rejectedfixed)*100),2)}%")
+
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method = "ONE-STOP" '''
+        data = uut.query(sql, ['cnt'])
+        mailfixedbymail = data[0]['cnt']
+        print(f"rejected voters fixed by mail: {mailfixedbymail} {round(((mailfixedbymail/rejectedfixed)*100),2)}%")
 
 
     def test_voters(self):
@@ -261,7 +312,7 @@ class MyTestCase(unittest.TestCase):
         uut = db()
         sql = "SELECT count (distinct ncid) from NC2020 as cnt "
         voters_unique = uut.query(sql, ['cnt'])[0]['cnt']
-        sql = "SELECT count (distinct ncid) from multivotes2020 as cnt "
+        sql = "SELECT count (distinct ncid) from rejected_voters_2020as cnt "
         voters_multi = uut.query(sql, ['cnt'])[0]['cnt']
         sql = 'select count(distinct ncid) from NC2020 where SDR = "Y" and ballot_rtn_status = "ACCEPTED"'
         voters_SDR_total = uut.query(sql, ['cnt'])[0]['cnt']
