@@ -1,0 +1,4 @@
+requests_cache
+requests
+simple_cache
+tqdm
