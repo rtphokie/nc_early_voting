@@ -293,18 +293,43 @@ class MyTestCase(unittest.TestCase):
         rejectedfixed = data[0]['cnt']
         print(f"rejected voters fixed: {rejectedfixed} {round(((rejectedfixed/rejectedtotal)*100),2)}%")
 
+        print("-----MAIL------")
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method != "None" '''
+        data = uut.query(sql, ['cnt'])
+        fixedmail = data[0]['cnt']
+        print(f"rejected mail voters fixed: {fixedmail} ")
+
+        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method = "None" '''
+        data = uut.query(sql, ['cnt'])
+        unfixedmail = data[0]['cnt']
+        print(f"rejected mail voters unfixed: {unfixedmail}")
+
         self.assertTrue(rejectednotfixed+rejectedfixed ==rejectedtotal )
+        sql = '''
+        select count(distinct ncid), accepted_method from rejected_voters_2020 where failed_methods like '%MAIL' group by accepted_method
+        '''
+        data = uut.query(sql, ['cnt', 'accepted_method'])
+        total=0
+        for row in data:
+            total+=row['cnt']
+        print (f"\nmail-in ballots fixed {total}:")
+        for row in data:
+            print(f"{row['accepted_method']}: {row['cnt']} {round(((row['cnt']/total)*100),2)}%")
 
-        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method = "MAIL" '''
+        sql = '''select count(distinct ncid) as cnt from rejected_voters_2020 where failed_methods like "%MAIL%" and failed_ballot_rtn_statuses like "%UNDELIVERABL%"'''
         data = uut.query(sql, ['cnt'])
-        mailfixedbymail = data[0]['cnt']
-        print(f"rejected voters fixed by mail: {mailfixedbymail} {round(((mailfixedbymail/rejectedfixed)*100),2)}%")
+        uspsret = data[0]['cnt']
+        print(f"returned: {uspsret} {round(((uspsret/rejectedtotal)*100),2)}%")
+        print()
+        for reason in [ 'WRONG VOTER', 'SPOILED', 'CANCELLED', 'WITNESS INFO INCOMPLETE', 'ACCEPTED', 'NOT VOTED',
+                        'PENDING CURE', 'PENDING', 'SIGNATURE DIFFERENT', 'CONFLICT', 'RETURNED UNDELIVERABL',
+                        'DUPLICATE', 'ASSISTANT INFO INCOMPLETE', 'E-TRANSMISSION FAILURE']:
+            sql = f'''select count(distinct ncid) as cnt from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method != "None" and failed_ballot_rtn_statuses like "%{reason}%"'''
+            data = uut.query(sql, ['cnt', 'accepted_method'])
+            cnt = data[0]['cnt']
+            print(f"{reason} {cnt}  {round(((cnt/fixedmail)*100),2)}%")
 
-
-        sql = '''select count(distinct ncid) as count from rejected_voters_2020 where failed_methods like "%MAIL%" and accepted_method = "ONE-STOP" '''
-        data = uut.query(sql, ['cnt'])
-        mailfixedbymail = data[0]['cnt']
-        print(f"rejected voters fixed by mail: {mailfixedbymail} {round(((mailfixedbymail/rejectedfixed)*100),2)}%")
 
 
     def test_voters(self):
